@@ -3,7 +3,7 @@
 # Parar o script se houver erro
 set -e
 
-echo "=== Iniciando Script de Implantação para Debian 12 ==="
+echo "=== Iniciando Script de Implantação para Debian 12 (Supabase Seguro) ==="
 
 # Verifica se é root
 if [ "$EUID" -ne 0 ]; then 
@@ -11,7 +11,7 @@ if [ "$EUID" -ne 0 ]; then
   exit
 fi
 
-# 0. Prompt para o Domínio/IP
+# 0. Configurações Iniciais
 read -p "Digite o domínio ou IP onde a aplicação será acessada (ex: 192.168.1.100 ou app.estoqx.com): " APP_DOMAIN
 if [ -z "$APP_DOMAIN" ]; then
     echo "Domínio não informado. Usando 'localhost'."
@@ -19,22 +19,32 @@ if [ -z "$APP_DOMAIN" ]; then
 fi
 echo "Usando domínio: $APP_DOMAIN"
 
-# 1. Atualizar o sistema e instalar dependências básicas
-echo "--- 1. Atualizando sistema e instalando dependências básicas ---"
-apt-get update && apt-get upgrade -y
-apt-get install -y ca-certificates curl gnupg git wget unzip
+WORK_DIR="/opt/estoqx"
 
-# 2. Instalar Docker e Docker Compose (Repositório Oficial)
-echo "--- 2. Instalando Docker e Docker Compose ---"
-# Remover versões antigas se existirem
+# 1. Atualizar e Instalar Dependências Gerais
+echo "--- 1. Atualizando sistema e instalando dependências ---"
+apt-get update && apt-get upgrade -y
+apt-get install -y ca-certificates curl gnupg git wget unzip openssl
+
+# 2. Instalar Node.js 20 (Necessário para gerar chaves JWT)
+echo "--- 2. Instalando Node.js 20 ---"
+if ! command -v node &> /dev/null; then
+    curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+    apt-get install -y nodejs
+else
+    echo "Node.js já instalado."
+fi
+
+# 3. Instalar Docker e Docker Compose
+echo "--- 3. Instalando Docker e Docker Compose ---"
+# Remover versões antigas
 for pkg in docker.io docker-doc docker-compose podman-docker containerd runc; do apt-get remove -y $pkg; done || true
 
-# Adicionar chave GPG oficial do Docker
+# Configurar repositório e instalar
 install -m 0755 -d /etc/apt/keyrings
 curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
 chmod a+r /etc/apt/keyrings/docker.gpg
 
-# Adicionar repositório
 echo \
   "deb [arch="$(dpkg --print-architecture)" signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian \
   "$(. /etc/os-release && echo "$VERSION_CODENAME")" stable" | \
@@ -43,24 +53,76 @@ echo \
 apt-get update
 apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 
-# Iniciar e habilitar Docker
 systemctl start docker
 systemctl enable docker
 
-echo "Docker instalado com sucesso!"
-
-# 3. Preparar diretório de trabalho
-WORK_DIR="/opt/estoqx"
+# 4. Preparar Diretório e Gerar Chaves de Segurança
+echo "--- 4. Preparando Diretório e Gerando Chaves Seguras ---"
 mkdir -p $WORK_DIR
 cd $WORK_DIR
-echo "Diretório de trabalho: $WORK_DIR"
 
-# 4. Configurar Supabase via Docker
-echo "--- 4. Configurando Supabase (Docker) ---"
-if [ -d "supabase" ]; then
-    echo "Pasta supabase já existe, pulando clone..."
-else
-    # Clona o repositório oficial do Supabase para pegar o setup docker
+# Script auxiliar Node.js para gerar chaves
+cat <<EOF > generate_keys.js
+const crypto = require('crypto');
+const fs = require('fs');
+const { execSync } = require('child_process');
+
+try {
+    require.resolve('jsonwebtoken');
+} catch (e) {
+    console.log('Instalando jsonwebtoken...');
+    execSync('npm install jsonwebtoken', { stdio: 'inherit' });
+}
+const jwt = require('jsonwebtoken');
+
+function generateSecret(length = 64) {
+    return crypto.randomBytes(length).toString('hex');
+}
+
+function generatePassword(length = 16) {
+    return crypto.randomBytes(length).toString('base64').replace(/[^a-zA-Z0-9]/g, '').slice(0, length);
+}
+
+const jwtSecret = generateSecret(40); // JWT Secret
+const anonKey = jwt.sign({ role: 'anon', iss: 'supabase' }, jwtSecret, { expiresIn: '10y' });
+const serviceKey = jwt.sign({ role: 'service_role', iss: 'supabase' }, jwtSecret, { expiresIn: '10y' });
+
+const keys = {
+    POSTGRES_PASSWORD: generatePassword(20),
+    JWT_SECRET: jwtSecret,
+    ANON_KEY: anonKey,
+    SERVICE_ROLE_KEY: serviceKey,
+    SECRET_KEY_BASE: generateSecret(64),
+    VAULT_ENC_KEY: crypto.randomBytes(16).toString('hex'), // precisa ser 32 chars hex
+    PG_META_CRYPTO_KEY: generateSecret(32),
+    DASHBOARD_PASSWORD: generatePassword(12)
+};
+
+fs.writeFileSync('generated_keys.json', JSON.stringify(keys, null, 2));
+console.log('Chaves geradas com sucesso.');
+EOF
+
+# Inicializa um package.json temporário para instalar jsonwebtoken sem afetar nada
+if [ ! -f package.json ]; then
+    npm init -y > /dev/null
+fi
+npm install jsonwebtoken --no-save
+
+echo "Gerando chaves..."
+node generate_keys.js
+# Ler chaves do JSON para variáveis bash
+POSTGRES_PASSWORD=$(grep '"POSTGRES_PASSWORD":' generated_keys.json | cut -d '"' -f 4)
+JWT_SECRET=$(grep '"JWT_SECRET":' generated_keys.json | cut -d '"' -f 4)
+ANON_KEY=$(grep '"ANON_KEY":' generated_keys.json | cut -d '"' -f 4)
+SERVICE_ROLE_KEY=$(grep '"SERVICE_ROLE_KEY":' generated_keys.json | cut -d '"' -f 4)
+SECRET_KEY_BASE=$(grep '"SECRET_KEY_BASE":' generated_keys.json | cut -d '"' -f 4)
+VAULT_ENC_KEY=$(grep '"VAULT_ENC_KEY":' generated_keys.json | cut -d '"' -f 4)
+PG_META_CRYPTO_KEY=$(grep '"PG_META_CRYPTO_KEY":' generated_keys.json | cut -d '"' -f 4)
+DASHBOARD_PASSWORD=$(grep '"DASHBOARD_PASSWORD":' generated_keys.json | cut -d '"' -f 4)
+
+# 5. Configurar Supabase
+echo "--- 5. Configurando Supabase ---"
+if [ ! -d "supabase" ]; then
     git clone --depth 1 https://github.com/supabase/supabase.git supabase-repo
     mv supabase-repo/docker supabase
     rm -rf supabase-repo
@@ -68,49 +130,53 @@ fi
 
 cd supabase
 
-# Copiar arquivo de exemplo .env
-if [ ! -f .env ]; then
-    cp .env.example .env
-    echo "Arquivo .env configurado."
-fi
+# Copiar example e substituir valores
+cp .env.example .env
 
-# Configurar API_EXTERNAL_URL para o domínio escolhido (importante para redirects funcionarem)
-# Usa sed para substituir a linha existente ou adiciona se não existir
-if grep -q "API_EXTERNAL_URL=" .env; then
-    sed -i "s|API_EXTERNAL_URL=.*|API_EXTERNAL_URL=http://$APP_DOMAIN:8000|g" .env
-else
-    echo "API_EXTERNAL_URL=http://$APP_DOMAIN:8000" >> .env
-fi
+# Funcão para substituir no .env (cross-platform sed)
+update_env() {
+    key=$1
+    val=$2
+    # Escapar caracteres especiais para o sed
+    escaped_val=$(printf '%s\n' "$val" | sed -e 's/[\/&]/\\&/g')
+    sed -i "s|^$key=.*|$key=$escaped_val|" .env
+}
 
-# Subir Supabase
-echo "Iniciando Supabase..."
+echo "Aplicando configurações no .env..."
+update_env "POSTGRES_PASSWORD" "$POSTGRES_PASSWORD"
+update_env "JWT_SECRET" "$JWT_SECRET"
+update_env "ANON_KEY" "$ANON_KEY"
+update_env "SERVICE_ROLE_KEY" "$SERVICE_ROLE_KEY"
+update_env "SECRET_KEY_BASE" "$SECRET_KEY_BASE"
+update_env "VAULT_ENC_KEY" "$VAULT_ENC_KEY"
+update_env "PG_META_CRYPTO_KEY" "$PG_META_CRYPTO_KEY"
+update_env "DASHBOARD_PASSWORD" "$DASHBOARD_PASSWORD"
+update_env "DASHBOARD_USERNAME" "admin"
+
+# Configurar URLs
+update_env "API_EXTERNAL_URL" "http://$APP_DOMAIN:8000"
+update_env "SUPABASE_PUBLIC_URL" "http://$APP_DOMAIN:8000"
+
+# Habilitar Studio se necessário (geralmente habilitado por padrão)
+
+echo "Iniciando Containers do Supabase..."
 docker compose pull
 docker compose up -d
 
-# Aguardar Supabase estar pronto
-echo "Aguardando Supabase iniciar (pode levar alguns minutos)..."
+# Aguardar Supabase
+echo "Aguardando Supabase ficar operacional..."
 until curl -s -f -o /dev/null "http://localhost:8000/rest/v1/"; do
-  echo "Aguardando API do Supabase (http://localhost:8000)..."
+  echo "Aguardando API do Supabase..."
   sleep 5
 done
-echo "Supabase está online!"
+echo "Supabase Online!"
 
-# Capturar chaves do arquivo .env do Supabase (removendo aspas se houver)
-ANON_KEY=$(grep "ANON_KEY=" .env | cut -d '=' -f2 | tr -d '"')
-SERVICE_KEY=$(grep "SERVICE_ROLE_KEY=" .env | cut -d '=' -f2 | tr -d '"')
-
-# Exibir informações de conexão
-echo "--- Informações do Supabase ---"
-echo "URL: http://$APP_DOMAIN:8000"
-echo "ANON KEY: $ANON_KEY"
-echo "SERVICE KEY: (Oculta por segurança)"
-
+# Voltar para raiz
 cd $WORK_DIR
 
-# 5. Clonar e Configurar Aplicação Estoqx
-echo "--- 5. Clonando Aplicação Estoqx ---"
+# 6. Aplicação Estoqx
+echo "--- 6. Configurando Aplicação Estoqx ---"
 if [ -d "estoqx-simple" ]; then
-    echo "Pasta estoqx-simple já existe. Atualizando..."
     cd estoqx-simple
     git pull
 else
@@ -118,40 +184,22 @@ else
     cd estoqx-simple
 fi
 
-# 6. Instalar Node.js e Dependências
-echo "--- 6. Instalando Node.js 20 e Dependências ---"
-curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-apt-get install -y nodejs
-
-echo "Instalando dependências do projeto..."
+echo "Instalando dependências da aplicação..."
 npm install
 
-# 7. Configurar .env da Aplicação
-echo "--- 7. Configurando .env da Aplicação ---"
-# Criar ou sobrescrever o .env com as credenciais do Supabase local
+# Criar .env da aplicação com as chaves recém geradas
 cat <<EOF > .env
 VITE_SUPABASE_PROJECT_ID="local-docker"
 VITE_SUPABASE_URL="http://$APP_DOMAIN:8000"
 VITE_SUPABASE_PUBLISHABLE_KEY="$ANON_KEY"
 EOF
 
-echo "Arquivo .env atualizado com as credenciais do Supabase Local."
-
-# 8. Teste de Conexão e Seed de Usuários
-echo "--- 8. Criando Usuários Iniciais ---"
-
-# Criar script temporário para seed
-cat <<EOF > seed_users.js
+# 7. Seed de Dados
+echo "--- 7. Criando Usuários Iniciais (Seed) ---"
+cat <<EOF > seed_deploy.js
 const { createClient } = require('@supabase/supabase-js');
-
-const supabaseUrl = 'http://localhost:8000';
-const serviceKey = '$SERVICE_KEY';
-
-const supabase = createClient(supabaseUrl, serviceKey, {
-  auth: {
-    autoRefreshToken: false,
-    persistSession: false
-  }
+const supabase = createClient('http://localhost:8000', '$SERVICE_ROLE_KEY', {
+  auth: { autoRefreshToken: false, persistSession: false }
 });
 
 const users = [
@@ -163,35 +211,46 @@ const users = [
 ];
 
 async function seed() {
-  console.log('Iniciando cadastro de usuários...');
   for (const user of users) {
-    // Tenta criar o usuário
-    const { data, error } = await supabase.auth.admin.createUser({
+    const { error } = await supabase.auth.admin.createUser({
       email: user.email,
       password: user.password,
       email_confirm: true,
       user_metadata: { role: user.role }
     });
-
-    if (error) {
-      console.error(\`Erro ao criar \${user.email}: \${error.message}\`);
-    } else {
-      console.log(\`Usuário criado com sucesso: \${user.email} (Role: \${user.role})\`);
-    }
+    if (error) console.log(\`Erro ao criar \${user.email}: \${error.message}\`);
+    else console.log(\`Criado: \${user.email}\`);
   }
 }
-
-seed().then(() => console.log('Seed finalizado.'));
+seed();
 EOF
 
-# Executar seed
-node seed_users.js
-rm seed_users.js
+node seed_deploy.js
+rm seed_deploy.js
 
-echo "--- Implantação Concluída! ---"
-echo "Aplicação configurada em: $WORK_DIR/estoqx-simple"
-echo "Para rodar em produção:"
-echo "cd $WORK_DIR/estoqx-simple && npm run build && npm run preview -- --host 0.0.0.0 --port 4173"
+# Salvar credenciais para o usuário
+cd $WORK_DIR
+cat <<EOF > CREDENCIAIS_DEPLOY.txt
+=== Credenciais de Instalação do Estoqx ===
+Data: $(date)
+Domínio: $APP_DOMAIN
+
+URL Aplicação: http://$APP_DOMAIN:4173 (Após rodar build)
+URL Supabase Studio: http://$APP_DOMAIN:8000
+    Usuário: admin
+    Senha: $DASHBOARD_PASSWORD
+
+POSTGRES_PASSWORD: $POSTGRES_PASSWORD
+JWT_SECRET: $JWT_SECRET
+SERVICE_ROLE_KEY: $SERVICE_ROLE_KEY
+ANON_KEY: $ANON_KEY
+
+Oculte este arquivo ou apague-o após salvar as senhas!
+EOF
+
+echo "--- IMPLANTAÇÃO CONCLUÍDA COM SUCESSO ---"
+echo "As credenciais foram salvas em: $WORK_DIR/CREDENCIAIS_DEPLOY.txt"
+echo "LEIA ESTE ARQUIVO PARA ACESSAR O SISTEMA!"
 echo ""
-echo "Acesse a aplicação em: http://$APP_DOMAIN:4173"
-echo "Acesse o Supabase Studio em: http://$APP_DOMAIN:8000"
+echo "Para rodar a aplicação em produção agora:"
+echo "cd $WORK_DIR/estoqx-simple && npm run build && npm run preview -- --host 0.0.0.0 --port 4173"
